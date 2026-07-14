@@ -1,0 +1,12 @@
+# Python virtual environment
+.venv/
+
+# Environment / secrets
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Private interview prep — do not publish
+interview-cheatsheet.md

@@ -7,7 +7,7 @@
 --        CREATE DATABASE nova;
 --   2) Connect to it, then run this file:
 --        \c nova
---        \i schema.sql
+--        \i postgres_schema.sql
 --
 -- Conventions:
 --   * snake_case identifiers (Postgres folds unquoted names to lowercase, so
@@ -59,14 +59,17 @@ CREATE TABLE pharmaceutical_company (
   phone VARCHAR(15)  NOT NULL
 );
 
--- Drug is a weak entity of pharmaceutical_company: trade_name is unique only
--- within a company, so the PK is composite. Requirement 4: deleting a company
--- deletes its drugs -> ON DELETE CASCADE.
+-- Drug uses a surrogate key (drug_id) so referencing tables (sells,
+-- prescription_drug) carry ONE column instead of the (trade_name, company_name)
+-- pair. The weak-entity rule "trade_name is unique only within a company" is
+-- still enforced, now via UNIQUE (trade_name, company_name) rather than the PK.
+-- Requirement 4: deleting a company deletes its drugs -> ON DELETE CASCADE.
 CREATE TABLE drug (
-  trade_name   VARCHAR(100),
+  drug_id      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  trade_name   VARCHAR(100) NOT NULL,
+  company_name VARCHAR(100) NOT NULL,
   formula      VARCHAR(200) NOT NULL,
-  company_name VARCHAR(100),
-  PRIMARY KEY (trade_name, company_name),
+  UNIQUE (trade_name, company_name),
   FOREIGN KEY (company_name) REFERENCES pharmaceutical_company(name) ON DELETE CASCADE
 );
 
@@ -82,24 +85,26 @@ CREATE TABLE pharmacy (
 -- the corresponding catalog/price rows go with it.
 CREATE TABLE sells (
   pharmacy_name VARCHAR(100),
-  trade_name    VARCHAR(100),
-  company_name  VARCHAR(100),
+  drug_id       BIGINT,
   price         DECIMAL(10,2) NOT NULL CHECK (price >= 0),
-  PRIMARY KEY (pharmacy_name, trade_name, company_name),
+  PRIMARY KEY (pharmacy_name, drug_id),
   FOREIGN KEY (pharmacy_name) REFERENCES pharmacy(name) ON DELETE CASCADE,
-  FOREIGN KEY (trade_name, company_name) REFERENCES drug(trade_name, company_name) ON DELETE CASCADE
+  FOREIGN KEY (drug_id) REFERENCES drug(drug_id) ON DELETE CASCADE
 );
 
--- contract history is preserved: start_date is part of the PK, so a
--- pharmacy/company pair can have successive contracts over time.
+-- Surrogate key (contract_id) so the API can address a contract as
+-- /contracts/{id} instead of a 3-part composite path. The natural key
+-- (pharmacy, company, start_date) is preserved as UNIQUE, so a pharmacy/company
+-- pair can still have successive contracts over time (contract history).
 CREATE TABLE contract (
-  pharmacy_name VARCHAR(100),
-  company_name  VARCHAR(100),
-  start_date    DATE,
-  end_date      DATE  NOT NULL,
-  content       TEXT  NOT NULL,
+  contract_id   BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  pharmacy_name VARCHAR(100) NOT NULL,
+  company_name  VARCHAR(100) NOT NULL,
+  start_date    DATE NOT NULL,
+  end_date      DATE NOT NULL,
+  content       TEXT NOT NULL,
   supervisor    VARCHAR(100) NOT NULL,  -- assigned per contract; may be changed
-  PRIMARY KEY (pharmacy_name, company_name, start_date),
+  UNIQUE (pharmacy_name, company_name, start_date),
   CHECK (end_date >= start_date),
   FOREIGN KEY (pharmacy_name) REFERENCES pharmacy(name) ON DELETE CASCADE,
   FOREIGN KEY (company_name)  REFERENCES pharmaceutical_company(name) ON DELETE CASCADE
@@ -133,14 +138,13 @@ CREATE TABLE prescription (
 
 CREATE TABLE prescription_drug (
   prescription_id BIGINT,
-  trade_name      VARCHAR(100),
-  company_name    VARCHAR(100),
+  drug_id         BIGINT,
   quantity        INT NOT NULL CHECK (quantity > 0),
-  PRIMARY KEY (prescription_id, trade_name, company_name),
+  PRIMARY KEY (prescription_id, drug_id),
   FOREIGN KEY (prescription_id)
       REFERENCES prescription(prescription_id) ON DELETE CASCADE,
-  FOREIGN KEY (trade_name, company_name)
-      REFERENCES drug(trade_name, company_name) ON DELETE CASCADE
+  FOREIGN KEY (drug_id)
+      REFERENCES drug(drug_id) ON DELETE CASCADE
 );
 
 -- =============================================================================
@@ -227,19 +231,17 @@ BEGIN
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE update_drug_formula(
-  p_trade_name VARCHAR, p_company_name VARCHAR, p_formula VARCHAR)
+CREATE OR REPLACE PROCEDURE update_drug_formula(p_drug_id BIGINT, p_formula VARCHAR)
 LANGUAGE plpgsql AS $$
 BEGIN
-  UPDATE drug SET formula = p_formula
-  WHERE trade_name = p_trade_name AND company_name = p_company_name;
+  UPDATE drug SET formula = p_formula WHERE drug_id = p_drug_id;
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE delete_drug(p_trade_name VARCHAR, p_company_name VARCHAR)
+CREATE OR REPLACE PROCEDURE delete_drug(p_drug_id BIGINT)
 LANGUAGE plpgsql AS $$
 BEGIN
-  DELETE FROM drug WHERE trade_name = p_trade_name AND company_name = p_company_name;
+  DELETE FROM drug WHERE drug_id = p_drug_id;
 END;
 $$;
 
@@ -268,33 +270,27 @@ $$;
 
 -- ---- sells -----------------------------------------------------------------
 CREATE OR REPLACE PROCEDURE insert_sells(
-  p_pharmacy_name VARCHAR, p_trade_name VARCHAR, p_company_name VARCHAR, p_price DECIMAL)
+  p_pharmacy_name VARCHAR, p_drug_id BIGINT, p_price DECIMAL)
 LANGUAGE plpgsql AS $$
 BEGIN
-  INSERT INTO sells(pharmacy_name, trade_name, company_name, price)
-  VALUES (p_pharmacy_name, p_trade_name, p_company_name, p_price);
+  INSERT INTO sells(pharmacy_name, drug_id, price)
+  VALUES (p_pharmacy_name, p_drug_id, p_price);
 END;
 $$;
 
 CREATE OR REPLACE PROCEDURE update_sells_price(
-  p_pharmacy_name VARCHAR, p_trade_name VARCHAR, p_company_name VARCHAR, p_price DECIMAL)
+  p_pharmacy_name VARCHAR, p_drug_id BIGINT, p_price DECIMAL)
 LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE sells SET price = p_price
-  WHERE pharmacy_name = p_pharmacy_name
-    AND trade_name    = p_trade_name
-    AND company_name  = p_company_name;
+  WHERE pharmacy_name = p_pharmacy_name AND drug_id = p_drug_id;
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE delete_sells(
-  p_pharmacy_name VARCHAR, p_trade_name VARCHAR, p_company_name VARCHAR)
+CREATE OR REPLACE PROCEDURE delete_sells(p_pharmacy_name VARCHAR, p_drug_id BIGINT)
 LANGUAGE plpgsql AS $$
 BEGIN
-  DELETE FROM sells
-  WHERE pharmacy_name = p_pharmacy_name
-    AND trade_name    = p_trade_name
-    AND company_name  = p_company_name;
+  DELETE FROM sells WHERE pharmacy_name = p_pharmacy_name AND drug_id = p_drug_id;
 END;
 $$;
 
@@ -310,24 +306,17 @@ END;
 $$;
 
 CREATE OR REPLACE PROCEDURE update_contract_supervisor(
-  p_pharmacy_name VARCHAR, p_company_name VARCHAR, p_start_date DATE, p_supervisor VARCHAR)
+  p_contract_id BIGINT, p_supervisor VARCHAR)
 LANGUAGE plpgsql AS $$
 BEGIN
-  UPDATE contract SET supervisor = p_supervisor
-  WHERE pharmacy_name = p_pharmacy_name
-    AND company_name  = p_company_name
-    AND start_date    = p_start_date;
+  UPDATE contract SET supervisor = p_supervisor WHERE contract_id = p_contract_id;
 END;
 $$;
 
-CREATE OR REPLACE PROCEDURE delete_contract(
-  p_pharmacy_name VARCHAR, p_company_name VARCHAR, p_start_date DATE)
+CREATE OR REPLACE PROCEDURE delete_contract(p_contract_id BIGINT)
 LANGUAGE plpgsql AS $$
 BEGIN
-  DELETE FROM contract
-  WHERE pharmacy_name = p_pharmacy_name
-    AND company_name  = p_company_name
-    AND start_date    = p_start_date;
+  DELETE FROM contract WHERE contract_id = p_contract_id;
 END;
 $$;
 
@@ -339,7 +328,7 @@ $$;
 --   * slip exists for that date -> reuse it, add/replace this drug line
 CREATE OR REPLACE PROCEDURE add_prescription_drug(
   p_patient_id VARCHAR, p_doctor_id VARCHAR, p_date DATE,
-  p_trade_name VARCHAR, p_company_name VARCHAR, p_quantity INT)
+  p_drug_id BIGINT, p_quantity INT)
 LANGUAGE plpgsql AS $$
 DECLARE
   v_id BIGINT;
@@ -357,33 +346,29 @@ BEGIN
     RETURNING prescription_id INTO v_id;
   END IF;
 
-  INSERT INTO prescription_drug(prescription_id, trade_name, company_name, quantity)
-  VALUES (v_id, p_trade_name, p_company_name, p_quantity)
-  ON CONFLICT (prescription_id, trade_name, company_name)
+  INSERT INTO prescription_drug(prescription_id, drug_id, quantity)
+  VALUES (v_id, p_drug_id, p_quantity)
+  ON CONFLICT (prescription_id, drug_id)
   DO UPDATE SET quantity = EXCLUDED.quantity;
 END;
 $$;
 
 CREATE OR REPLACE PROCEDURE update_prescription_qty(
-  p_prescription_id BIGINT, p_trade_name VARCHAR, p_company_name VARCHAR, p_quantity INT)
+  p_prescription_id BIGINT, p_drug_id BIGINT, p_quantity INT)
 LANGUAGE plpgsql AS $$
 BEGIN
   UPDATE prescription_drug SET quantity = p_quantity
-  WHERE prescription_id = p_prescription_id
-    AND trade_name      = p_trade_name
-    AND company_name    = p_company_name;
+  WHERE prescription_id = p_prescription_id AND drug_id = p_drug_id;
 END;
 $$;
 
 -- Remove a single drug line from a prescription.
 CREATE OR REPLACE PROCEDURE delete_prescription_drug(
-  p_prescription_id BIGINT, p_trade_name VARCHAR, p_company_name VARCHAR)
+  p_prescription_id BIGINT, p_drug_id BIGINT)
 LANGUAGE plpgsql AS $$
 BEGIN
   DELETE FROM prescription_drug
-  WHERE prescription_id = p_prescription_id
-    AND trade_name      = p_trade_name
-    AND company_name    = p_company_name;
+  WHERE prescription_id = p_prescription_id AND drug_id = p_drug_id;
 END;
 $$;
 
@@ -403,14 +388,15 @@ $$;
 CREATE OR REPLACE FUNCTION get_prescriptions_in_period(
   p_patient_id VARCHAR, p_from DATE, p_to DATE)
 RETURNS TABLE(prescription_id BIGINT, doctor_id VARCHAR, prescription_date DATE,
-              trade_name VARCHAR, company_name VARCHAR, quantity INT)
+              drug_id BIGINT, trade_name VARCHAR, company_name VARCHAR, quantity INT)
 LANGUAGE plpgsql AS $$
 BEGIN
   RETURN QUERY
     SELECT p.prescription_id, p.doctor_id, p.prescription_date,
-           pd.trade_name, pd.company_name, pd.quantity
+           d.drug_id, d.trade_name, d.company_name, pd.quantity
     FROM prescription p
     JOIN prescription_drug pd ON pd.prescription_id = p.prescription_id
+    JOIN drug d ON d.drug_id = pd.drug_id
     WHERE p.patient_id = p_patient_id
       AND p.prescription_date BETWEEN p_from AND p_to
     ORDER BY p.prescription_date;
@@ -420,24 +406,25 @@ $$;
 -- 3. Details of a patient's prescription on a specific date.
 CREATE OR REPLACE FUNCTION get_prescription_by_date(p_patient_id VARCHAR, p_date DATE)
 RETURNS TABLE(prescription_id BIGINT, doctor_id VARCHAR,
-              trade_name VARCHAR, company_name VARCHAR, quantity INT)
+              drug_id BIGINT, trade_name VARCHAR, company_name VARCHAR, quantity INT)
 LANGUAGE plpgsql AS $$
 BEGIN
   RETURN QUERY
-    SELECT p.prescription_id, p.doctor_id, pd.trade_name, pd.company_name, pd.quantity
+    SELECT p.prescription_id, p.doctor_id, d.drug_id, d.trade_name, d.company_name, pd.quantity
     FROM prescription p
     JOIN prescription_drug pd ON pd.prescription_id = p.prescription_id
+    JOIN drug d ON d.drug_id = pd.drug_id
     WHERE p.patient_id = p_patient_id AND p.prescription_date = p_date;
 END;
 $$;
 
 -- 4. Drugs produced by a pharmaceutical company.
 CREATE OR REPLACE FUNCTION get_drugs_by_company(p_company_name VARCHAR)
-RETURNS TABLE(trade_name VARCHAR, formula VARCHAR)
+RETURNS TABLE(drug_id BIGINT, trade_name VARCHAR, formula VARCHAR)
 LANGUAGE plpgsql AS $$
 BEGIN
   RETURN QUERY
-    SELECT d.trade_name, d.formula FROM drug d WHERE d.company_name = p_company_name;
+    SELECT d.drug_id, d.trade_name, d.formula FROM drug d WHERE d.company_name = p_company_name;
 END;
 $$;
 
@@ -446,12 +433,14 @@ $$;
 --    "stock position" here = the drug catalog the pharmacy sells + its prices.
 --    If an inventory count were required, add sells.stock_qty and return it.
 CREATE OR REPLACE FUNCTION get_pharmacy_stock(p_pharmacy_name VARCHAR)
-RETURNS TABLE(trade_name VARCHAR, company_name VARCHAR, price DECIMAL)
+RETURNS TABLE(drug_id BIGINT, trade_name VARCHAR, company_name VARCHAR, price DECIMAL)
 LANGUAGE plpgsql AS $$
 BEGIN
   RETURN QUERY
-    SELECT s.trade_name, s.company_name, s.price
-    FROM sells s WHERE s.pharmacy_name = p_pharmacy_name;
+    SELECT d.drug_id, d.trade_name, d.company_name, s.price
+    FROM sells s
+    JOIN drug d ON d.drug_id = s.drug_id
+    WHERE s.pharmacy_name = p_pharmacy_name;
 END;
 $$;
 
